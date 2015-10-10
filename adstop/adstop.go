@@ -1,34 +1,3 @@
-/*
-adstop is an ad-blocking transparent HTTP/HTTPS proxy.
-
-It was designed to run on low power, low memory ARM devices and serve a couple
-of clients, mostly old smartphones which cannot run adblockers themselves.
-
-Before using it, you have to configure your devices and network to make it
-accessible as a transparent proxy. One way to achieve this is to install
-a VPN on the server side and redirect all HTTP/HTTPS traffic to the proxy
-with routing rules. Then make the client browse through the VPN.
-
-HTTPS filtering requires the proxy to intercept the device traffic and decrypt
-it. To allow this, you have to generate a certificate and add it to your
-device.
-
-You also need to generate a certificate
-
-	$ adstop -http localhost:1080 \
-		-https localhost:1081     \
-		-cache .adstop			  \
-		-max-age 24h			  \
-		-ca-cert /path/to/ca.cert \
-		-ca-key /path/to/ca.key   \
-		https://easylist-downloads.adblockplus.org/easylist.txt \
-		some_local_list.txt
-
-starts the proxy and makes it listen on HTTP on port 1080, HTTPS on port 1081,
-fetch and load rules from easylist and a local file, cache easylist in an
-.adstop/ directory and refresh it every 24 hours.
-
-*/
 package main
 
 import (
@@ -42,9 +11,11 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -53,13 +24,15 @@ import (
 )
 
 var (
-	httpAddr  = flag.String("http", "localhost:1080", "HTTP handler address")
-	httpsAddr = flag.String("https", "localhost:1081", "HTTPS handler address")
-	logp      = flag.Bool("log", false, "enable logging")
-	cacheDir  = flag.String("cache", ".cache", "cache directory")
-	maxAgeArg = flag.String("max-age", "24h", "cached entries max age")
-	caCert    = flag.String("ca-cert", "", "path to CA certificate")
-	caKey     = flag.String("ca-key", "", "path to CA key")
+	timeoutStr  = flag.String("timeout", "5m", "HTTP/TCP connections global timeout")
+	httpAddr    = flag.String("http", "localhost:1080", "HTTP handler address")
+	httpsAddr   = flag.String("https", "localhost:1081", "HTTPS handler address")
+	httpDebug   = flag.String("debug-addr", "", "HTTP debug address")
+	logRequests = flag.Uint64("log", 0, "enable logging")
+	cacheDir    = flag.String("cache", ".cache", "cache directory")
+	maxAgeArg   = flag.String("max-age", "24h", "cached entries max age")
+	caCert      = flag.String("ca-cert", "", "path to CA certificate")
+	caKey       = flag.String("ca-key", "", "path to CA key")
 )
 
 type FilteringHandler struct {
@@ -67,10 +40,19 @@ type FilteringHandler struct {
 }
 
 func logRequest(r *http.Request) {
-	log.Printf("%s %s %s %s\n", r.Proto, r.Method, r.URL, r.Host)
 	buf := &bytes.Buffer{}
+	fmt.Fprintf(buf, "REQ\n<REQUEST\n%s %s %s %s\n", r.Proto, r.Method, r.URL, r.Host)
 	r.Header.Write(buf)
-	log.Println(string(buf.Bytes()))
+	fmt.Fprintf(buf, "REQUEST>\n")
+	log.Println(buf.String())
+}
+
+func logResponse(r *http.Response) {
+	buf := &bytes.Buffer{}
+	fmt.Fprintf(buf, "RSP\n<RESPONSE\n%s %s\n", r.Proto, r.Status)
+	r.Header.Write(buf)
+	fmt.Fprintf(buf, "RESPONSE>\n")
+	log.Println(buf.String())
 }
 
 func getReferrerDomain(r *http.Request) string {
@@ -91,10 +73,6 @@ type ProxyState struct {
 
 func (h *FilteringHandler) OnRequest(r *http.Request, ctx *goproxy.ProxyCtx) (
 	*http.Request, *http.Response) {
-
-	if *logp {
-		logRequest(r)
-	}
 
 	host := r.URL.Host
 	if host == "" {
@@ -137,6 +115,7 @@ func (h *FilteringHandler) OnResponse(r *http.Response,
 		// The request was rejected by the previous handler
 		return r
 	}
+
 	duration2 := time.Duration(0)
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err == nil && len(mediaType) > 0 {
@@ -165,6 +144,11 @@ func (h *FilteringHandler) OnResponse(r *http.Response,
 			return goproxy.NewResponse(ctx.Req, goproxy.ContentTypeText,
 				http.StatusNotFound, "Not Found")
 		}
+	}
+
+	if atomic.LoadUint64(logRequests)%2 == 1 {
+		logRequest(ctx.Req)
+		logResponse(r)
 	}
 	log.Printf("accepted in %d/%dms: %s\n", state.Duration, duration2, state.URL)
 	return r
@@ -300,8 +284,63 @@ func makeCertificate(certPath, keyPath string) (*tls.Certificate, error) {
 	return &ca, err
 }
 
+func runDebugServer(addr string) error {
+	http.HandleFunc("/trace", func(w http.ResponseWriter, r *http.Request) {
+		res := atomic.AddUint64(logRequests, 1)
+		action := "logging requests"
+		if res%2 == 0 {
+			action = "ignoring requests"
+		}
+		fmt.Fprintf(w, "%s\n", action)
+	})
+	return http.ListenAndServe(addr, nil)
+}
+
+func listenTransparentTLS(proxy *goproxy.ProxyHttpServer, addr string,
+	timeout time.Duration) error {
+
+	// listen to the TLS ClientHello but make it a CONNECT request instead
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			log.Printf("error accepting new connection - %v", err)
+			continue
+		}
+		go func(c net.Conn) {
+			c.SetDeadline(time.Now().Add(timeout))
+			tlsConn, err := vhost.TLS(c)
+			if err != nil {
+				log.Printf("error accepting new connection - %v", err)
+			}
+			if tlsConn.Host() == "" {
+				log.Printf("cannot support non-SNI enabled clients")
+				return
+			}
+			connectReq := &http.Request{
+				Method: "CONNECT",
+				URL: &url.URL{
+					Opaque: tlsConn.Host(),
+					Host:   net.JoinHostPort(tlsConn.Host(), "443"),
+				},
+				Host:   tlsConn.Host(),
+				Header: make(http.Header),
+			}
+			resp := dumbResponseWriter{tlsConn}
+			proxy.ServeHTTP(resp, connectReq)
+		}(c)
+	}
+}
+
 func runProxy() error {
 	flag.Parse()
+	timeout, err := time.ParseDuration(*timeoutStr)
+	if err != nil {
+		return fmt.Errorf("could not parse timeout %s: %s", *timeoutStr, err)
+	}
 	if *caCert == "" || *caKey == "" {
 		return fmt.Errorf("CA certificate and key must be specified")
 	}
@@ -324,6 +363,13 @@ func runProxy() error {
 	}
 	h := &FilteringHandler{
 		Cache: cache,
+	}
+
+	if *httpDebug != "" {
+		log.Printf("starting debug server on %s", *httpDebug)
+		go func() {
+			log.Println(runDebugServer(*httpDebug))
+		}()
 	}
 
 	log.Printf("starting servers")
@@ -356,43 +402,23 @@ func runProxy() error {
 
 	proxy.OnRequest().DoFunc(h.OnRequest)
 	proxy.OnResponse().DoFunc(h.OnResponse)
+
+	done := make(chan error)
 	go func() {
-		http.ListenAndServe(*httpAddr, proxy)
+		server := http.Server{
+			Addr:         *httpAddr,
+			Handler:      proxy,
+			ReadTimeout:  timeout,
+			WriteTimeout: timeout,
+		}
+		done <- server.ListenAndServe()
 	}()
 
-	// listen to the TLS ClientHello but make it a CONNECT request instead
-	ln, err := net.Listen("tcp", *httpsAddr)
-	if err != nil {
-		return err
-	}
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			log.Printf("error accepting new connection - %v", err)
-			continue
-		}
-		go func(c net.Conn) {
-			tlsConn, err := vhost.TLS(c)
-			if err != nil {
-				log.Printf("error accepting new connection - %v", err)
-			}
-			if tlsConn.Host() == "" {
-				log.Printf("cannot support non-SNI enabled clients")
-				return
-			}
-			connectReq := &http.Request{
-				Method: "CONNECT",
-				URL: &url.URL{
-					Opaque: tlsConn.Host(),
-					Host:   net.JoinHostPort(tlsConn.Host(), "443"),
-				},
-				Host:   tlsConn.Host(),
-				Header: make(http.Header),
-			}
-			resp := dumbResponseWriter{tlsConn}
-			proxy.ServeHTTP(resp, connectReq)
-		}(c)
-	}
+	go func() {
+		done <- listenTransparentTLS(proxy, *httpsAddr, timeout)
+	}()
+
+	return <-done
 }
 
 func main() {
